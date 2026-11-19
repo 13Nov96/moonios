@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>月讀 WiFi 傳書</title>
+<style>
+body{margin:0;font-family:-apple-system,"PingFang TC","Microsoft JhengHei",sans-serif;background:#f4f4f1;color:#1d1d1f}
+.w{max-width:640px;margin:40px auto;padding:0 20px}
+h1{font-size:24px;margin:0 0 4px}
+.sub{color:#6e6e73;font-size:14px;margin-bottom:22px}
+.card{background:#fff;border:1px solid #e3e3e0;border-radius:14px;padding:20px;margin-bottom:16px}
+#code{font-size:34px;letter-spacing:8px;width:240px;padding:8px 12px;border:1px solid #ccc;border-radius:10px;text-align:center;font-variant-numeric:tabular-nums}
+button{font:inherit;padding:10px 18px;border-radius:10px;border:1px solid #2f6fb3;background:#2f6fb3;color:#fff;cursor:pointer}
+button.sec{background:#fff;color:#2f6fb3}
+button:disabled{opacity:.5;cursor:default}
+#drop{border:2px dashed #b9c4d0;border-radius:14px;padding:40px 20px;text-align:center;color:#6e6e73;transition:.15s}
+#drop.on{border-color:#2f6fb3;background:#eef4fb;color:#2f6fb3}
+#st{margin:10px 0;font-size:15px}
+.it{display:flex;justify-content:space-between;gap:10px;font-size:14px;padding:6px 0;border-bottom:1px solid #eee}
+.it .n{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.it .p{flex:none;color:#6e6e73}
+.ok{color:#1a8f3c!important}.bad{color:#c33!important}
+</style>
+</head>
+<body>
+<div class="w">
+  <h1>月讀 WiFi 傳書</h1>
+  <div class="sub">在 iPhone 月讀按「⋯」→「WiFi 傳書」，把畫面上的配對碼輸入下方。</div>
+  <div class="card" id="pairCard">
+    <input id="code" inputmode="numeric" maxlength="7" placeholder="000000" autocomplete="off">
+    <button id="bConn">連線</button>
+    <div id="st"></div>
+  </div>
+  <div class="card" id="sendCard" style="opacity:.4;pointer-events:none">
+    <div id="drop">把書檔拖到這裡（可一次多本）<br><small>EPUB、PDF、TXT、靜讀天下備份 .mrpro、整包 .zip</small><br><br>
+      <button class="sec" id="bPick">選擇檔案</button> <button class="sec" id="bDir">選擇資料夾</button></div>
+    <input type="file" id="fPick" multiple hidden>
+    <input type="file" id="fDir" webkitdirectory multiple hidden>
+    <div id="list" style="margin-top:12px"></div>
+  </div>
+</div>
+<script src="../vendor/peerjs.min.js"></script>
+<script>
+const $ = s => document.querySelector(s);
+const OK = /\.(epub|pdf|txt|mrpro|mrstd|zip|po|json)$/i;
+const CHUNK = 64 * 1024;
+let peer, conn, queue = [], sending = false, acks = {};
+const st = (m, c) => { $('#st').textContent = m; $('#st').className = c || ''; };
+function opts() { const q = new URLSearchParams(location.search).get('ps'); if (!q) return { debug: 0 }; const [host, port] = q.split(':'); return { host, port: +port || 9000, path: '/', secure: false, debug: 0 }; }
+$('#code').addEventListener('keydown', e => { if (e.key === 'Enter') connect(); });
+$('#bConn').onclick = connect;
+function connect() {
+  const code = $('#code').value.replace(/\D/g, '');
+  if (code.length !== 6) { st('請輸入 6 位數配對碼', 'bad'); return; }
+  if (peer) peer.destroy();
+  st('連線中…'); $('#bConn').disabled = true;
+  peer = new Peer(opts());
+  peer.on('error', e => { st(e.type === 'peer-unavailable' ? '找不到這個配對碼，請確認手機畫面上的號碼' : '連線錯誤：' + e.type, 'bad'); $('#bConn').disabled = false; });
+  peer.on('open', () => {
+    conn = peer.connect('moonios-' + code, { reliable: true, serialization: 'binary' });
+    const to = setTimeout(() => { if (!conn.open) { st('連不上手機。請確認兩台在同一個 WiFi，或換配對碼重試', 'bad'); $('#bConn').disabled = false; } }, 20000);
+    conn.on('open', () => { clearTimeout(to); st('已連上手機 ✓', 'ok'); $('#sendCard').style.cssText = ''; $('#bConn').disabled = false; });
+    conn.on('data', d => {
+      if (d && d.t === 'ack' && acks[d.name]) acks[d.name]();
+      if (d && d.t === 'importing') st('手機匯入中…');
+      if (d && d.t === 'imported') st(`手機已匯入 ${d.n} 個檔案 ✓ 可繼續傳送`, 'ok');
+    });
+    conn.on('close', () => { st('手機已中斷連線', 'bad'); $('#sendCard').style.cssText = 'opacity:.4;pointer-events:none'; });
+  });
+}
+const drop = $('#drop');
+['dragenter', 'dragover'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.add('on'); }));
+['dragleave', 'drop'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove('on'); }));
+drop.addEventListener('drop', async e => {
+  const items = Array.from(e.dataTransfer.items || []).map(i => i.webkitGetAsEntry && i.webkitGetAsEntry()).filter(Boolean);
+  if (items.length) { const out = []; for (const it of items) await walk(it, out); enqueue(out); } else enqueue(Array.from(e.dataTransfer.files));
+});
+async function walk(entry, out) {
+  if (entry.isFile) { out.push(await new Promise((r, j) => entry.file(r, j))); return; }
+  const rd = entry.createReader(); let batch;
+  do { batch = await new Promise((r, j) => rd.readEntries(r, j)); for (const c of batch) await walk(c, out); } while (batch.length);
+}
+$('#bPick').onclick = () => $('#fPick').click(); $('#bDir').onclick = () => $('#fDir').click();
+$('#fPick').onchange = e => { enqueue(Array.from(e.target.files)); e.target.value = ''; };
+$('#fDir').onchange = e => { enqueue(Array.from(e.target.files)); e.target.value = ''; };
+function enqueue(files) {
+  const good = files.filter(f => OK.test(f.name) && !f.name.startsWith('.'));
+  if (!good.length) { st('沒有可傳的檔案（支援 EPUB／PDF／TXT／.mrpro／.zip）', 'bad'); return; }
+  for (const f of good) { const el = document.createElement('div'); el.className = 'it'; el.innerHTML = '<span class="n"></span><span class="p">等待</span>'; el.querySelector('.n').textContent = f.name; $('#list').appendChild(el); queue.push({ f, el }); }
+  run();
+}
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+async function run() {
+  if (sending || !conn || !conn.open) return; sending = true; let n = 0;
+  while (queue.length) {
+    const { f, el } = queue.shift(); const p = el.querySelector('.p');
+    try {
+      const acked = new Promise(r => { acks[f.name] = r; });
+      conn.send({ t: 'start', name: f.name, size: f.size });
+      for (let o = 0; o < f.size; o += CHUNK) {
+        while ((conn.dataChannel && conn.dataChannel.bufferedAmount > 4 * 1024 * 1024) || (conn.bufferSize || 0) > 64) await sleep(15);
+        conn.send(await f.slice(o, o + CHUNK).arrayBuffer());
+        p.textContent = Math.floor(Math.min(f.size, o + CHUNK) / f.size * 100) + '%';
+      }
+      conn.send({ t: 'end' });
+      await acked; delete acks[f.name]; p.textContent = '✓'; p.className = 'p ok'; n++;
+    } catch (e) { p.textContent = '失敗'; p.className = 'p bad'; }
+  }
+  conn.send({ t: 'done' }); st(`已送出 ${n} 個檔案，手機匯入中…`);
+  sending = false;
+}
+</script>
+</body>
+</html>
